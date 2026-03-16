@@ -10,6 +10,10 @@ const userSchema = new mongoose.Schema({
         hasCompletedOnboarding: { type: Boolean, default: false },
         masterPasscodeHash: { type: String }
     },
+    // Vault key management for future-proof encryption
+    vaultKeyEncryptedForServer: { type: String }, // Enc_SK(DK)
+    vaultKeyEncryptedForUser: { type: String },   // Enc_PK(DK) - client-managed
+    encryptionVersion: { type: Number, default: 1 },
     createdAt: { type: Date, default: Date.now }
 });
 
