@@ -273,7 +273,7 @@ app.post('/api/users/:userId/passcode', authMiddleware, async (req, res) => {
             return res.status(403).json({ error: 'Forbidden' });
         }
 
-        const { vaultKeyEncryptedForUser } = req.body;
+        const { vaultKeyEncryptedForUser, dataKey } = req.body;
         if (!vaultKeyEncryptedForUser) {
             return res.status(400).json({ error: 'vaultKeyEncryptedForUser is required' });
         }
@@ -281,11 +281,17 @@ app.post('/api/users/:userId/passcode', authMiddleware, async (req, res) => {
         const user = await User.findById(req.params.userId);
         if (!user) return res.status(404).json({ error: 'User not found' });
 
-        // Ensure the user has a server-wrapped DK; if not, create one now
-        if (!user.vaultKeyEncryptedForServer) {
-            const dk = generateDataKey();
-            user.vaultKeyEncryptedForServer = encryptWithServerKey(dk.toString('hex'));
+        // If client supplied a dataKey, use it to create/update the server-wrapped DK
+        if (dataKey) {
+            user.vaultKeyEncryptedForServer = encryptWithServerKey(dataKey);
             user.encryptionVersion = user.encryptionVersion || 1;
+        } else {
+            // Ensure the user has a server-wrapped DK; if not, create one now
+            if (!user.vaultKeyEncryptedForServer) {
+                const dk = generateDataKey();
+                user.vaultKeyEncryptedForServer = encryptWithServerKey(dk.toString('hex'));
+                user.encryptionVersion = user.encryptionVersion || 1;
+            }
         }
 
         user.vaultKeyEncryptedForUser = vaultKeyEncryptedForUser;
