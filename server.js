@@ -16,12 +16,13 @@ const app = express();
 const PORT = process.env.PORT || 5003;
 const MONGO_URI = process.env.MONGO_URI;
 
-// Encryption Configuration
+// Encryption Configuration (server key used for at-rest encryption)
 const ENCRYPTION_KEY = Buffer.from(process.env.ENCRYPTION_KEY || '', 'hex');
 const IV_LENGTH = 16;
 const ALGORITHM = 'aes-256-cbc';
 
-function encrypt(text) {
+// Encrypt arbitrary text using the server key (SK)
+function encryptWithServerKey(text) {
     if (!text) return text;
     try {
         const iv = crypto.randomBytes(IV_LENGTH);
@@ -35,7 +36,8 @@ function encrypt(text) {
     }
 }
 
-function decrypt(text) {
+// Decrypt text that was encrypted with the server key (SK)
+function decryptWithServerKey(text) {
     if (!text) return text;
     try {
         const textParts = text.split(':');
@@ -53,6 +55,11 @@ function decrypt(text) {
         console.error('Decryption error:', e);
         return text;
     }
+}
+
+// Generate a random 32-byte data key (DK) for a user vault
+function generateDataKey() {
+    return crypto.randomBytes(32); // 256-bit key
 }
 
 app.use(cors());
@@ -165,15 +172,34 @@ app.post('/api/auth/verify-otp', async (req, res) => {
         }
 
         if (!user) {
+            // Create a new data key for this user and wrap it with the server key
+            const dk = generateDataKey();
+            const vaultKeyEncryptedForServer = encryptWithServerKey(dk.toString('hex'));
+
             user = new User({
                 email,
                 username,
-                password: passwordHash
+                password: passwordHash, // Save password if provided
+                vaultKeyEncryptedForServer,
+                vaultKeyEncryptedForUser: '', // Will be set after passcode onboarding
+                encryptionVersion: 1
             });
             await user.save();
-        } else if (passwordHash) {
-            // Update password if provided (for registration update or forgot-password)
-            user.password = passwordHash;
+        } else {
+            // User exists (maybe from previous partial registration or older account)
+            // If they provided a password NOW, update it. 
+            // This fixes "No password set" error if they register again or reset process.
+            if (passwordHash) {
+                user.password = passwordHash;
+            }
+
+            // Ensure existing users also have a data key generated for future use
+            if (!user.vaultKeyEncryptedForServer) {
+                const dk = generateDataKey();
+                user.vaultKeyEncryptedForServer = encryptWithServerKey(dk.toString('hex'));
+                user.encryptionVersion = user.encryptionVersion || 1;
+            }
+
             await user.save();
         }
 
@@ -221,13 +247,99 @@ app.put('/api/users/:userId/settings', authMiddleware, async (req, res) => {
             return res.status(403).json({ error: 'Forbidden' });
         }
 
+        const updateData = {};
+        for (const key in req.body) {
+            updateData[`settings.${key}`] = req.body[key];
+        }
+
         const user = await User.findByIdAndUpdate(
             req.params.userId,
-            { $set: { settings: { ...req.body } } },
+            { $set: updateData },
             { new: true, upsert: true }
         );
         res.json(user.settings);
     } catch (error) {
+        console.error('Settings update error:', error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// --- Vault Key / Passcode Routes ---
+
+// Set initial vault key wrapper for user passcode (called after passcode creation)
+app.post('/api/users/:userId/passcode', authMiddleware, async (req, res) => {
+    try {
+        if (req.params.userId !== req.userId.toString()) {
+            return res.status(403).json({ error: 'Forbidden' });
+        }
+
+        const { vaultKeyEncryptedForUser } = req.body;
+        if (!vaultKeyEncryptedForUser) {
+            return res.status(400).json({ error: 'vaultKeyEncryptedForUser is required' });
+        }
+
+        const user = await User.findById(req.params.userId);
+        if (!user) return res.status(404).json({ error: 'User not found' });
+
+        // Ensure the user has a server-wrapped DK; if not, create one now
+        if (!user.vaultKeyEncryptedForServer) {
+            const dk = generateDataKey();
+            user.vaultKeyEncryptedForServer = encryptWithServerKey(dk.toString('hex'));
+            user.encryptionVersion = user.encryptionVersion || 1;
+        }
+
+        user.vaultKeyEncryptedForUser = vaultKeyEncryptedForUser;
+        await user.save();
+
+        res.json({ message: 'Passcode vault key wrapper set' });
+    } catch (error) {
+        console.error('Set passcode error:', error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Get vault key encrypted for user (client will unwrap with passcode-derived key)
+app.get('/api/users/:userId/vault-key-for-user', authMiddleware, async (req, res) => {
+    try {
+        if (req.params.userId !== req.userId.toString()) {
+            return res.status(403).json({ error: 'Forbidden' });
+        }
+
+        const user = await User.findById(req.params.userId);
+        if (!user) return res.status(404).json({ error: 'User not found' });
+
+        res.json({
+            vaultKeyEncryptedForUser: user.vaultKeyEncryptedForUser || '',
+            encryptionVersion: user.encryptionVersion || 1
+        });
+    } catch (error) {
+        console.error('Get vault key error:', error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Change passcode: client re-wraps DK and sends new wrapper
+app.put('/api/users/:userId/passcode-change', authMiddleware, async (req, res) => {
+    try {
+        if (req.params.userId !== req.userId.toString()) {
+            return res.status(403).json({ error: 'Forbidden' });
+        }
+
+        const { vaultKeyEncryptedForUser } = req.body;
+        if (!vaultKeyEncryptedForUser) {
+            return res.status(400).json({ error: 'vaultKeyEncryptedForUser is required' });
+        }
+
+        const user = await User.findByIdAndUpdate(
+            req.params.userId,
+            { vaultKeyEncryptedForUser },
+            { new: true }
+        );
+        if (!user) return res.status(404).json({ error: 'User not found' });
+
+        res.json({ message: 'Passcode vault key wrapper updated' });
+    } catch (error) {
+        console.error('Change passcode error:', error);
         res.status(500).json({ error: 'Server error' });
     }
 });
@@ -297,15 +409,15 @@ app.get('/api/entries/:userId', authMiddleware, async (req, res) => {
         }
         const entries = await Entry.find({ userId: req.params.userId });
 
-        // Decrypt sensitive data before sending to client
+        // Decrypt sensitive data before sending to client using server key
         const decryptedEntries = entries.map(entry => {
             const entryObj = entry.toObject();
-            entryObj.password = decrypt(entryObj.password);
+            entryObj.password = decryptWithServerKey(entryObj.password);
 
             if (entryObj.customFields) {
                 entryObj.customFields = entryObj.customFields.map(field => {
                     if (field.isEncrypted) {
-                        return { ...field, value: decrypt(field.value) };
+                        return { ...field, value: decryptWithServerKey(field.value) };
                     }
                     return field;
                 });
@@ -324,14 +436,14 @@ app.post('/api/entries', async (req, res) => {
     try {
         const entryData = { ...req.body };
 
-        // Encrypt password
-        entryData.password = encrypt(entryData.password);
+        // Encrypt password with server key
+        entryData.password = encryptWithServerKey(entryData.password);
 
         // Encrypt custom fields if marked
         if (entryData.customFields) {
             entryData.customFields = entryData.customFields.map(field => {
                 if (field.isEncrypted) {
-                    return { ...field, value: encrypt(field.value) };
+                    return { ...field, value: encryptWithServerKey(field.value) };
                 }
                 return field;
             });
@@ -345,11 +457,11 @@ app.post('/api/entries', async (req, res) => {
 
         // Return decrypted version
         const savedObj = savedEntry.toObject();
-        savedObj.password = decrypt(savedObj.password);
+        savedObj.password = decryptWithServerKey(savedObj.password);
         if (savedObj.customFields) {
             savedObj.customFields = savedObj.customFields.map(field => {
                 if (field.isEncrypted) {
-                    return { ...field, value: decrypt(field.value) };
+                    return { ...field, value: decryptWithServerKey(field.value) };
                 }
                 return field;
             });
@@ -366,14 +478,14 @@ app.put('/api/entries/:id', authMiddleware, async (req, res) => {
     try {
         const entryData = { ...req.body };
 
-        // Encrypt password
-        entryData.password = encrypt(entryData.password);
+        // Encrypt password with server key
+        entryData.password = encryptWithServerKey(entryData.password);
 
         // Encrypt custom fields if marked
         if (entryData.customFields) {
             entryData.customFields = entryData.customFields.map(field => {
                 if (field.isEncrypted) {
-                    return { ...field, value: encrypt(field.value) };
+                    return { ...field, value: encryptWithServerKey(field.value) };
                 }
                 return field;
             });
@@ -386,11 +498,11 @@ app.put('/api/entries/:id', authMiddleware, async (req, res) => {
         );
 
         const savedObj = updatedEntry.toObject();
-        savedObj.password = decrypt(savedObj.password);
+        savedObj.password = decryptWithServerKey(savedObj.password);
         if (savedObj.customFields) {
             savedObj.customFields = savedObj.customFields.map(field => {
                 if (field.isEncrypted) {
-                    return { ...field, value: decrypt(field.value) };
+                    return { ...field, value: decryptWithServerKey(field.value) };
                 }
                 return field;
             });
